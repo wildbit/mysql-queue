@@ -1,5 +1,5 @@
 (defproject mysql-queue "0.1.0-SNAPSHOT"
-  :description "a durable queue with scheduled job support that is backed by MySQL."
+  :description "A durable queue with scheduled job support that is backed by MySQL."
   :url "https://github.com/wildbit/mysql-queue"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}

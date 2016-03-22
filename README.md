@@ -1,6 +1,14 @@
 # mysql-queue
 
+[![Build Status](https://travis-ci.org/wildbit/mysql-queue.svg?branch=master)](https://travis-ci.org/wildbit/mysql-queue)
+
 A Clojure library that implements a MySQL-backed durable queue with support for scheduled jobs.
+
+## Install
+
+Get it from Clojars:
+
+[![Clojars Project](https://img.shields.io/clojars/v/mysql-queue.svg)](https://clojars.org/mysql-queue)
 
 ## Why
 
