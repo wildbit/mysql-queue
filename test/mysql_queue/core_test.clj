@@ -88,8 +88,8 @@
                               :err-fn #(deliver exception %)
                               :max-scheduler-sleep-interval 0.5
                               :max-recovery-sleep-interval 0.5)]
-      (is (deref success? 10000 false)
-          (str "Failed to process " num-jobs " test jobs in 10 seconds.\n"
+      (is (deref success? 15000 false)
+          (str "Failed to process " num-jobs " test jobs in 15 seconds.\n"
                "Missing job IDs: " (clj-set/difference expected-set @check-ins) "\n"
                "Exception?: " (deref exception 0 "nope")))
       (is (= num-jobs (count @check-ins))
@@ -121,8 +121,8 @@
                                   :err-fn #(deliver exception %)
                                   :max-scheduler-sleep-interval 0.5
                                   :max-recovery-sleep-interval 0.5)]
-        (is (deref success? 10000 false)
-            (str "Failed to process " num-jobs " test jobs in 10 seconds.\n"
+        (is (deref success? 15000 false)
+            (str "Failed to process " num-jobs " test jobs in 15 seconds.\n"
                  "Missing job IDs: " (clj-set/difference expected-set @check-ins) "\n"
                  "Exception?: " (deref exception 0 "nope")))
         (is (= num-jobs (count @check-ins))
@@ -148,8 +148,8 @@
                               :recovery-threshold-mins 0
                               :max-scheduler-sleep-interval 0.5
                               :max-recovery-sleep-interval 0.5)]
-      (is (deref success? 10000 false)
-          (str "Failed to process " num-jobs " test jobs in 10 seconds.\n"
+      (is (deref success? 15000 false)
+          (str "Failed to process " num-jobs " test jobs in 15 seconds.\n"
                "Missing job IDs: " (clj-set/difference expected-set @check-ins) "\n"
                "Exception?: " (deref exception 0 "nope")))
       (is (= num-jobs (count @check-ins))
