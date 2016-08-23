@@ -5,7 +5,6 @@ services:
 jdk:
   - openjdk7
   - oraclejdk7
-  - openjdk8
   - oraclejdk8
 script: "lein2 test-all"
 before_script: "echo 'CREATE DATABASE IF NOT EXISTS clj_mysql_queue;' | mysql -uroot"
