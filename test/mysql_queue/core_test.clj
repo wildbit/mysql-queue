@@ -7,7 +7,7 @@
             [mysql-queue.queries :as queries]))
 
 (def db-conn {:subprotocol "mysql"
-              :subname "//localhost:3306/clj_mysql_queue"
+              :subname "//localhost:3306/clj_mysql_queue?useSSL=false"
               :user "root"
               :password ""})
 
