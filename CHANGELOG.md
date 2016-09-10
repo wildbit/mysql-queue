@@ -1,3 +1,12 @@
 # Change Log
-All notable changes to this project will be documented in this file. This change log follows the conventions of [keepachangelog.com](http://keepachangelog.com/).
+All notable changes to this project are documented in this file. This change log follows the conventions of [keepachangelog.com](http://keepachangelog.com/).
+
+## [Unreleased]
+
+### Fixed
+- Internal: Fixed possible test failures in non-UTC timezones.
+- Internal: Fixed graceful shutdown test.
+
+### Changed
+- Use JVM time when querying for pending jobs instead of relying on UTC.
 
