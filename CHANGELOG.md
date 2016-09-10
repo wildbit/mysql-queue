@@ -1,7 +1,7 @@
 # Change Log
 All notable changes to this project are documented in this file. This change log follows the conventions of [keepachangelog.com](http://keepachangelog.com/).
 
-## [Unreleased]
+## [0.2.0] - 2016-09-10
 
 ### Fixed
 - Fix `queue/initialize!` that fails to create MySQL tables due to index conflict.
