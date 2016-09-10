@@ -10,4 +10,5 @@ All notable changes to this project are documented in this file. This change log
 
 ### Changed
 - Use JVM time when querying for pending jobs instead of relying on UTC.
+- Verify the library works properly on Java 8.
 
