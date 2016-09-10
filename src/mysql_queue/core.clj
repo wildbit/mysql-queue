@@ -304,8 +304,8 @@
 (defn initialize!
   "Create required MySQL tables if they don't exist. Returns true."
   [db-conn]
-  (queries/create-jobs! db-conn)
   (queries/create-scheduled-jobs! db-conn)
+  (queries/create-jobs! db-conn)
   true)
 
 (defn schedule-job
