@@ -4,8 +4,9 @@ All notable changes to this project are documented in this file. This change log
 ## [Unreleased]
 
 ### Fixed
-- Internal: Fixed possible test failures in non-UTC timezones.
-- Internal: Fixed graceful shutdown test.
+- Fix `queue/initialize!` that fails to create MySQL tables due to index conflict.
+- Internal: Fix possible test failures in non-UTC timezones.
+- Internal: Fix graceful shutdown test.
 
 ### Changed
 - Use JVM time when querying for pending jobs instead of relying on UTC.

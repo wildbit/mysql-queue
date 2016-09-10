@@ -17,8 +17,7 @@
 
 (defn setup-db
   [f]
-  (queries/create-scheduled-jobs! db-conn)
-  (queries/create-jobs! db-conn)
+  (initialize! db-conn)
   (f))
 
 (defn clean-up
