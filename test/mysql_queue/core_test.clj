@@ -61,8 +61,8 @@
                               :err-fn #(deliver exception %)
                               :max-scheduler-sleep-interval 0.5
                               :max-recovery-sleep-interval 0.5)]
-      (is (deref success? 10000 false)
-          (str "Failed to process " num-jobs " test jobs in 10 seconds.\n"
+      (is (deref success? 15000 false)
+          (str "Failed to process " num-jobs " test jobs in 15 seconds.\n"
                "Missing job IDs: " (clj-set/difference expected-set @check-ins) "\n"
                "Exception?: " (deref exception 0 "nope")))
       (is (= num-jobs (count @check-ins))
@@ -159,14 +159,15 @@
         expected-set (->> num-jobs range (map inc) (into #{}))
         success? (promise)
         exception (promise)
+        lock (promise)
         check-ins (check-in-atom expected-set success?)
         jobs {:test-foo (fn [status {id :id :as args}]
+                          @lock
                           (Thread/sleep 1500)
                           (swap! check-ins conj id)
                           [:done args])}
         _ (dotimes [n num-jobs]
-            (let [scheduled-id (schedule-job db-conn :test-foo :begin {:id (inc n)} (java.util.Date.))]
-              (queries/insert-job<! db-conn scheduled-id 0 "test-foo" "begin" (pr-str {:id (inc n)}) 1)))]
+            (schedule-job db-conn :test-foo :begin {:id (inc n)} (java.util.Date.)))]
     (with-worker [wrk (worker db-conn
                               jobs
                               :num-consumer-threads 2
@@ -174,11 +175,12 @@
                               :recovery-threshold-mins 0
                               :max-scheduler-sleep-interval 0.5
                               :max-recovery-sleep-interval 0.5)]
-      (Thread/sleep 500))
-      (is (deref success? 10 false)
-          (str "Failed to finish " num-jobs " test jobs taking 1500ms with 2s quit timeout.\n"
-               "Missing job IDs: " (clj-set/difference expected-set @check-ins) "\n"
-               "Exception?: " (deref exception 0 "nope")))
-      (is (= num-jobs (count @check-ins))
-          "The number of executed jobs doesn't match the number of jobs queued.")))
+      (deliver lock :unlocked)
+      (Thread/sleep 1000))
+    (is (deref success? 10 false)
+        (str "Failed to finish " num-jobs " test jobs taking 1500ms with 2s quit timeout.\n"
+             "Missing job IDs: " (clj-set/difference expected-set @check-ins) "\n"
+             "Exception?: " (deref exception 0 "nope")))
+    (is (= num-jobs (count @check-ins))
+        "The number of executed jobs doesn't match the number of jobs queued.")))
 

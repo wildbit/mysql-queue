@@ -70,12 +70,12 @@
                      scheduled_jobs LEFT JOIN
                      jobs ON scheduled_jobs.id=jobs.scheduled_job_id
                    WHERE
-                     scheduled_jobs.scheduled_for <= UTC_TIMESTAMP() AND
+                     scheduled_jobs.scheduled_for <= ? AND
                      jobs.id IS NULL AND
                      scheduled_jobs.name IN (" (in-query-stubs jobs-names) ") AND
                      scheduled_jobs.id NOT IN (" (in-query-stubs sieved-ids) ")
                    LIMIT ?")]
-            (concat jobs-names sieved-ids [n]))))
+            (concat [(java.util.Date.)] jobs-names sieved-ids [n]))))
 
 (defn select-jobs-by-ids
   [db ids]
@@ -95,12 +95,12 @@
                      jobs.status NOT IN (" (in-query-stubs ultimate-statuses) ") AND
                      jobs.name IN (" (in-query-stubs job-names) ") AND
                      jobs.id NOT IN (" (in-query-stubs sieved-ids) ") AND
-                     jobs.created_at + INTERVAL ? MINUTE <= UTC_TIMESTAMP()
+                     jobs.created_at + INTERVAL ? MINUTE <= ?
                    LIMIT ?")]
             ultimate-statuses
             job-names
             sieved-ids
-            [threshold-mins n])))
+            [threshold-mins (java.util.Date.) n])))
 
 (defn delete-scheduled-job-by-id!
   [db id]
