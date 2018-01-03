@@ -20,7 +20,8 @@
   (stop [worker timeout-secs]))
 
 (defrecord Worker [db-conn input-chan status consumer-threads scheduler-thread recovery-thread options]
-  Stoppable (stop [this timeout-secs]
+  Stoppable
+  (stop [this timeout-secs]
     (when (= :running @status)
       (swap! status (constantly :stopped))
       (close! input-chan)
