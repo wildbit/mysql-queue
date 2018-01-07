@@ -6,6 +6,12 @@
             [mysql-queue.core :refer :all]
             [mysql-queue.queries :as queries]))
 
+(Thread/setDefaultUncaughtExceptionHandler
+  (reify Thread$UncaughtExceptionHandler
+    (uncaughtException [_ thread throwable]
+      (println "WARNING!!! Uncaught exception in core async:")
+      (println throwable))))
+
 (def db-conn {:subprotocol "mysql"
               :subname "//localhost:3306/clj_mysql_queue?useSSL=false"
               :user "root"
@@ -23,6 +29,8 @@
 (defn clean-up
   [f]
   (delete-scheduled-jobs-by-name! db-conn "test-foo")
+  (delete-scheduled-jobs-by-name! db-conn "slow-job")
+  (delete-scheduled-jobs-by-name! db-conn "quick-job")
   (f))
 
 (use-fixtures :once setup-db)
@@ -93,6 +101,46 @@
                "Exception?: " (deref exception 0 "nope")))
       (is (= num-jobs (count @check-ins))
           "The number of executed jobs doesn't match the number of jobs queued."))))
+
+(deftest unbalanced-parallel-job-processing-test
+  (let [num-slow-jobs 1
+        num-quick-jobs 5
+        expected-slow-set (->> num-slow-jobs range (map inc) (into #{}))
+        expected-quick-set (->> num-quick-jobs range (map inc) (into #{}))
+        quick-success? (promise)
+        slow-success? (promise)
+        exception (promise)
+        slow-check-ins (check-in-atom expected-slow-set slow-success?)
+        quick-check-ins (check-in-atom expected-quick-set quick-success?)
+        jobs {:quick-job (fn [status {id :id :as args}]
+                           (swap! quick-check-ins conj id)
+                           [:done args])
+              :slow-job (fn [status {id :id :as args}]
+                          (when (deref quick-success? 2000 false)
+                            (swap! slow-check-ins conj id))
+                          [:done args])}
+        _ (dotimes [n num-slow-jobs]
+            (schedule-job db-conn :slow-job :begin {:id (inc n)} (java.util.Date.)))
+        _ (dotimes [n num-quick-jobs]
+            (schedule-job db-conn :quick-job :begin {:id (inc n)} (java.util.Date.)))]
+    (with-worker [wrk (worker db-conn
+                              jobs
+                              :prefetch 3
+                              :num-consumer-threads 2
+                              :err-fn #(deliver exception %)
+                              :max-scheduler-sleep-interval 0.1)]
+      (is (deref slow-success? 2000 false)
+          (str "Failed to process 1 slow job and " num-quick-jobs
+               " quick jobs in 2 seconds.\n"
+               "Missing slow job IDs: " (clj-set/difference expected-slow-set
+                                                            @slow-check-ins) "\n"
+               "Missing quick job IDs: " (clj-set/difference expected-quick-set
+                                                            @quick-check-ins) "\n"
+               "Exception?: " (deref exception 0 "nope")))
+      (is (= num-slow-jobs (count @slow-check-ins))
+          "The number of executed slow jobs doesn't match the number of jobs queued.")
+      (is (= num-quick-jobs (count @quick-check-ins))
+          "The number of executed quick jobs doesn't match the number of jobs queued."))))
 
 (deftest distributed-job-processing-test
   (let [num-jobs 100
