@@ -1,13 +1,14 @@
 (ns mysql-queue.core
   "A MySQL-backed durable queue implementation with scheduled jobs support."
-  (:import (com.mysql.jdbc.exceptions.jdbc4 MySQLIntegrityConstraintViolationException))
   (:require [mysql-queue.queries :as queries]
-            [mysql-queue.utils :refer [while-let fn-options with-error-handler]]
+            [mysql-queue.utils :refer [while-let fn-options with-error-handler profile-block meter ns->ms]]
             [clojure.string :as string]
             [clojure.set :as clj-set]
             [clojure.edn :as edn]
-            [clojure.core.async :as async :refer [chan >!! >! <! <!! go go-loop thread thread-call close! timeout alts!!]]
-            [clojure.core.async.impl.protocols :as async-proto :refer [closed?]]))
+            [clojure.core.async :as async :refer [chan >!! >! <! <!! go go-loop thread thread-call close! timeout alts! alts!!]]
+            [clojure.core.async.impl.protocols :as async-proto :refer [closed?]])
+  (:import (com.mysql.jdbc.exceptions.jdbc4 MySQLIntegrityConstraintViolationException)
+           (java.util Date)))
 
 (def ultimate-job-states #{:canceled :failed :done})
 (def max-retries 5)
@@ -19,11 +20,12 @@
 (defprotocol Stoppable
   (stop [worker timeout-secs]))
 
-(defrecord Worker [db-conn input-chan status consumer-threads scheduler-thread recovery-thread options]
+(defrecord Worker
+  [db-conn input-chan status sieve status-threads consumer-threads scheduler-thread recovery-thread options]
   Stoppable
   (stop [this timeout-secs]
-    (when (= :running @status)
-      (swap! status (constantly :stopped))
+    (when (:running @status)
+      (swap! status assoc :running false)
       (close! input-chan)
       (let [consumer-shutdowns (->> consumer-threads
                                     (concat [scheduler-thread recovery-thread])
@@ -154,28 +156,32 @@
   (finished? [job]
     (ultimate-job-states (:status job)))
   (execute [{:as job job-fn :user-fn :keys [status parameters attempt]} db-conn log-fn err-fn]
-    (if-not (ultimate-job-states status)
-      (try
-        (log-fn :info job "Executing job " job)
-        (let [[status params] (-> (job-fn status parameters) job-result-or-nil (or [:done nil]))]
-          (-> job (beget status params) (persist db-conn)))
-        (catch Exception e
-          (err-fn e)
-          (if (< attempt max-retries)
-            (-> job beget (persist db-conn))
-            (-> job (beget :failed) (persist db-conn)))))
-      (cleanup job db-conn)))
+    (profile-block [m]
+      (if (finished? job)
+        (cleanup job db-conn)
+        (try
+          (log-fn :info job "Executing job " job)
+          (let [[status params] (-> (meter m :job-fn (job-fn status parameters))
+                                    job-result-or-nil (or [:done nil]))]
+            (-> job (beget status params) (persist db-conn)))
+          (catch Exception e
+            (err-fn e)
+            (if (< attempt max-retries)
+              (-> job beget (persist db-conn))
+              (-> job (beget :failed) (persist db-conn))))))))
   StuckJob
   (finished? [job] false)
   (execute [job db-conn log-fn err-fn]
-    (log-fn :info job "Recovering job " job)
-    (-> job beget (persist db-conn)))
+    (profile-block [_]
+      (log-fn :info job "Recovering job " job)
+      (-> job beget (persist db-conn))))
   ScheduledJob
   (finished? [job]
     (throw (UnsupportedOperationException. "finished? is not implemented for ScheduledJob.")))
   (execute [job db-conn log-fn _err-fn]
-    (log-fn :info job "Executing job " job)
-    (-> job beget (persist db-conn))))
+    (profile-block [_]
+      (log-fn :info job "Executing job " job)
+      (-> job beget (persist db-conn)))))
 
 (defn- get-scheduled-jobs
   "Searches for ready scheduled jobs and attempts to insert root jobs for each of those.
@@ -206,37 +212,115 @@
       total
       false)))
 
+(defn- default-status
+  "Build the default status map for a given number of consumer threads."
+  [{:keys [num-consumer-threads
+           recovery-threshold-mins
+           min-scheduler-sleep-interval
+           max-scheduler-sleep-interval
+           min-recovery-sleep-interval
+           max-recovery-sleep-interval]}]
+  {:running true
+   :consumers (mapv #(hash-map :n (inc %)
+                               :started-at (Date.)
+                               :jobs-executed 0N
+                               :recent-jobs [])
+                    (range num-consumer-threads))
+   :recovery {:started-at (Date.)
+              :min-interval min-recovery-sleep-interval
+              :max-interval max-recovery-sleep-interval
+              :iterations 0N
+              :jobs-published 0N}
+   :scheduler {:started-at (Date.)
+               :min-interval min-scheduler-sleep-interval
+               :max-interval max-scheduler-sleep-interval
+               :recovery-threshold-mins recovery-threshold-mins
+               :iterations 0N
+               :jobs-published 0N}})
+
 (defn- consumer-thread
   "Consumer loop. Automatically quits if the listen-chan is closed. Runs in a go-thread."
-  [listen-chan db-conn log-fn err-fn]
+  [id listen-chan status-chan db-conn log-fn err-fn]
   (go
     (while-let [job (<! listen-chan)]
       (try
-        (loop [job job]
-          (when job
-            (log-fn :debug job "Consumer received job " job)
-            (recur (<! (thread (execute job db-conn log-fn err-fn))))))
+        (log-fn :debug job "Consumer received job " job)
+        (loop [current-job job
+               metrics {}]
+          (if current-job
+            (do
+              (>! status-chan {:id id :state :running-job :job current-job})
+              (let [[next-job dmetrics] (<! (thread (execute current-job db-conn log-fn err-fn)))]
+                (recur next-job (merge-with + metrics dmetrics))))
+            (do
+              (>! status-chan {:id id :state :finished-job :job current-job :metrics metrics})
+              (log-fn :info current-job "Completed job " job " in " (ns->ms (:full metrics)) "ms")
+              nil)))
         (catch Exception e
+          (>! status-chan {:id id :state :error :job job})
           (log-fn :error job "Unexpected error " e " in consumer loop when running job " job)
           (err-fn e))))
+    (>! status-chan {:id id :state :quit})
     (log-fn :debug "Consumer Thread" "Consumer is stopping...")
     :done))
 
 (defn- publisher-thread
   "Publisher loop. Automatically quits if the publish-chan is closed. Runs in a go-thread."
-  [min-sleep-secs max-sleep-secs source-fn log-fn]
+  [status-chan min-sleep-secs max-sleep-secs source-fn log-fn]
   (go-loop [last-exec (System/currentTimeMillis)]
-    (if-let [num-jobs (<! (thread-call source-fn))]
+    (if-let [published (<! (thread-call source-fn))]
       (do
-        (if (zero? num-jobs)
+        (>! status-chan {:state :running :jobs-published published})
+        (if (zero? published)
           (<! (timeout (max (* 1000 min-sleep-secs)
                             (- (* 1000 max-sleep-secs)
                                (- (System/currentTimeMillis) last-exec)))))
-          (log-fn :debug nil "Published " num-jobs " new jobs."))
+          (log-fn :debug nil "Published " published " new jobs."))
         (recur (System/currentTimeMillis)))
       (do
+        (>! status-chan {:state :quit :jobs-published 0})
         (log-fn :debug nil "Publisher is stopping...")
         :done))))
+
+(defn- status-threads
+  "Status loop. Listens for status updates from consumer and publisher threads.
+   Runs multiple go-threads."
+  [status num-kept-jobs]
+  (let [consumer-chan (chan)
+        scheduler-chan (chan)
+        recovery-chan (chan)
+        consumer-fn (fn [{:keys [recent-jobs] :as status} consumer-state job metrics]
+                      (let [current-time (Date.)
+                            finished? (= consumer-state :finished-job)
+                            overflow (inc (- (count recent-jobs) num-kept-jobs))
+                            overflow? (pos? overflow)
+                            job (assoc job :metrics metrics :processed-at current-time)]
+                        (cond-> status
+                          true (assoc :last-update-at current-time
+                                      :last-job job
+                                      :state consumer-state)
+                          (and finished? overflow?) (update :recent-jobs subvec overflow)
+                          finished? (update :jobs-executed inc)
+                          finished? (update :recent-jobs conj job))))
+        consumer-thread (go
+                          (while-let [{:keys [id job state metrics]} (<! consumer-chan)]
+                            (swap! status update-in [:consumers id] consumer-fn state job metrics)))
+        publisher-fn (fn [status publisher-state jobs-published]
+                       (-> status
+                           (assoc :last-update-at (Date.)
+                                  :state publisher-state
+                                  :jobs-published-last-run jobs-published)
+                           (update :jobs-published + jobs-published)
+                           (update :iterations inc)))
+        scheduler-thread (go
+                           (while-let [{:keys [state jobs-published]} (<! scheduler-chan)]
+                             (swap! status update :scheduler publisher-fn state jobs-published)))
+        recovery-thread (go
+                          (while-let [{:keys [state jobs-published]} (<! recovery-chan)]
+                            (swap! status update :recovery publisher-fn state jobs-published)))]
+    {:consumer {:channel consumer-chan :thread consumer-thread}
+     :scheduler {:channel scheduler-chan :thread scheduler-thread}
+     :recovery {:channel recovery-chan :thread recovery-thread}}))
 
 (defn- sieve->ids
   "Returns a sieve seq that can be used to filter SQL queries for
@@ -264,13 +348,13 @@
             (>! ch v))
           (recur))
         (close! ch)))
-    (doseq [out-ch out-chs]
-      (go-loop [last-v nil]
-        (if-let [v (<! ch)]
-          (do
-            (>! out-ch v)
-            (swap! sieve disj last-v)
-            (recur v))
+    (go-loop [occupations {}]
+      (if-let [v (<! ch)]
+        (let [[v ch] (alts! (map #(vector %1 v) out-chs))]
+          (when-let [occupation (occupations ch)]
+            (swap! sieve disj occupation))
+          (recur (assoc occupations ch v)))
+        (doseq [out-ch out-chs]
           (close! out-ch))))
     [in-ch out-chs sieve]))
 
@@ -346,6 +430,7 @@
    fn-bindings
    &{:keys [buffer-size
             prefetch
+            num-stats-jobs
             num-consumer-threads
             min-scheduler-sleep-interval
             max-scheduler-sleep-interval
@@ -356,6 +441,7 @@
             err-fn]
      :or {buffer-size 10
           prefetch 10
+          num-stats-jobs 50
           num-consumer-threads 2
           min-scheduler-sleep-interval 0
           max-scheduler-sleep-interval 10
@@ -372,14 +458,32 @@
          (fn? err-fn)]}
   (let [log-fn (quiet-log-fn log-fn)
         err-fn (quiet-err-fn err-fn)
+        options {:buffer-size buffer-size
+                 :prefetch prefetch
+                 :num-stats-jobs num-stats-jobs
+                 :num-consumer-threads num-consumer-threads
+                 :min-scheduler-sleep-interval min-scheduler-sleep-interval
+                 :max-scheduler-sleep-interval max-scheduler-sleep-interval
+                 :min-recovery-sleep-interval min-recovery-sleep-interval
+                 :max-recovery-sleep-interval max-recovery-sleep-interval
+                 :recovery-threshold-mins recovery-threshold-mins
+                 :log-fn log-fn
+                 :err-fn err-fn}
+        status (atom (default-status options))
+        {:as status-threads
+         {consumer-status-channel :channel} :consumer
+         {recovery-status-channel :channel} :recovery
+         {scheduler-status-channel :channel} :scheduler} (status-threads status num-stats-jobs)
         queue-chan (chan buffer-size)
         [in-ch out-chs sieve] (deduplicate queue-chan num-consumer-threads)
         consumer-threads (->> out-chs
-                              (map #(consumer-thread % db-conn log-fn err-fn))
+                              (map-indexed
+                                #(consumer-thread %1 %2 consumer-status-channel db-conn log-fn err-fn))
                               (into [])
                               doall)
         handler (partial publisher-error-handler log-fn err-fn)
-        scheduler-thread (publisher-thread min-scheduler-sleep-interval
+        scheduler-thread (publisher-thread scheduler-status-channel
+                                           min-scheduler-sleep-interval
                                            max-scheduler-sleep-interval
                                            (with-error-handler [(handler "scheduler thread")]
                                              (batch-publish in-ch
@@ -388,7 +492,8 @@
                                                                                 fn-bindings
                                                                                 (sieve->ids @sieve ScheduledJob))))
                                            log-fn)
-        recovery-thread (publisher-thread min-recovery-sleep-interval
+        recovery-thread (publisher-thread recovery-status-channel
+                                          min-recovery-sleep-interval
                                           max-recovery-sleep-interval
                                           (with-error-handler [(handler "recovery thread")]
                                             (batch-publish in-ch
@@ -401,16 +506,11 @@
     (log-fn :info nil "Starting a new worker...")
     (->Worker db-conn
               in-ch
-              (atom :running)
+              status
+              sieve
+              status-threads
               consumer-threads
               scheduler-thread
               recovery-thread
-              {:buffer-size buffer-size
-               :prefetch prefetch
-               :num-consumer-threads num-consumer-threads
-               :min-scheduler-sleep-interval min-scheduler-sleep-interval
-               :max-scheduler-sleep-interval max-scheduler-sleep-interval
-               :recovery-threshold-mins recovery-threshold-mins
-               :log-fn log-fn
-               :err-fn err-fn})))
+              options)))
 
