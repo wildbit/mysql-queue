@@ -32,6 +32,19 @@
        (catch Exception e#
          (~f e#)))))
 
+(defn numeric-stats
+  "Returns a map containing the minimum (:min), the maximum (:max),
+   the median (:median), the mean (:mean), and the 90 percentile (:90p)."
+  [s]
+  (when (seq s)
+    (let [sorted (sort s)
+          length (count s)]
+      {:min (first sorted)
+       :max (last sorted)
+       :mean (float (/ (reduce + s) length))
+       :median (nth sorted (dec (/ length 2)))
+       :90p (nth sorted (dec (/ (* 9 length) 10)))})))
+
 (defn ns->ms
   "Converts a value in nanoseconds to milliseconds."
   [t]

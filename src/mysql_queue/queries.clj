@@ -51,7 +51,7 @@
                        :created_at (java.util.Date.)})))
 
 (defn insert-job<!
-  [db scheduled-job-id parent-id job-name job-status parameters attempt]
+  [db scheduled-job-id parent-id job-name job-status parameters attempt created-at]
   (first (sql/insert! db :jobs
                       {:scheduled_job_id scheduled-job-id
                        :parent_id parent-id
@@ -59,7 +59,7 @@
                        :status job-status
                        :parameters parameters
                        :attempt attempt
-                       :created_at (java.util.Date.)})))
+                       :created_at created-at})))
 
 (defn select-n-ready-scheduled-jobs
   [db jobs-names sieved-ids n]
@@ -105,4 +105,31 @@
 (defn delete-scheduled-job-by-id!
   [db id]
   (sql/delete! db :scheduled_jobs ["id=?" id]))
+
+(defn select-jobs-status
+  [db ultimate-statuses job-names stuck-threshold-mins]
+  (sql/query db
+    (concat [(str "SELECT
+                     COALESCE(SUM(created_at + INTERVAL ? MINUTE <= ?), 0) AS stuck,
+                     COUNT(*) AS total
+                   FROM jobs
+                   WHERE
+                     status NOT IN (" (in-query-stubs ultimate-statuses) ") AND
+                     name IN (" (in-query-stubs job-names) ")")]
+            [stuck-threshold-mins (java.util.Date.)]
+            ultimate-statuses
+            job-names)
+    {:result-set-fn first}))
+
+(defn select-scheduled-jobs-status
+  [db job-names]
+  (sql/query db
+    (concat [(str "SELECT
+                     COALESCE(SUM(scheduled_for <= ?), 0) AS overdue,
+                     COUNT(*) total
+                   FROM scheduled_jobs
+                   WHERE name IN (" (in-query-stubs job-names) ")")]
+            [(java.util.Date.)]
+            job-names)
+    {:result-set-fn first}))
 

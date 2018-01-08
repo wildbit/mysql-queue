@@ -187,7 +187,7 @@
                           [:done args])}
         _ (dotimes [n num-jobs]
             (let [scheduled-id (schedule-job db-conn :test-foo :begin {:id (inc n)} (java.util.Date.))]
-              (queries/insert-job<! db-conn scheduled-id 0 "test-foo" "begin" (pr-str {:id (inc n)}) 1)))]
+              (queries/insert-job<! db-conn scheduled-id 0 "test-foo" "begin" (pr-str {:id (inc n)}) 1 (java.util.Date.))))]
     (with-worker [wrk (worker db-conn
                               jobs
                               :num-consumer-threads 1
@@ -231,4 +231,69 @@
              "Exception?: " (deref exception 0 "nope")))
     (is (= num-jobs (count @check-ins))
         "The number of executed jobs doesn't match the number of jobs queued.")))
+
+(deftest status-test
+  (let [num-jobs 100
+        expected-set (->> num-jobs range (map inc) (into #{}))
+        success? (promise)
+        exception (promise)
+        check-ins (check-in-atom expected-set success?)
+        jobs {:test-foo (fn [status {id :id :as args}]
+                          (Thread/sleep 20)
+                          (swap! check-ins conj id)
+                          [:done args])}]
+    (with-worker [wrk (worker db-conn
+                              jobs
+                              :num-consumer-threads 1
+                              :err-fn #(deliver exception %)
+                              :max-scheduler-sleep-interval 0.5
+                              :max-recovery-sleep-interval 2)]
+      ; Initial status
+      (let [{{:keys [scheduled-jobs jobs]} :db-queue
+             :keys [consumers prefetched-jobs]}
+            (status wrk)]
+        (is (= 1 (count consumers)))
+        (is (zero? (:overdue scheduled-jobs)))
+        (is (zero? (:total scheduled-jobs)))
+        (is (zero? (:stuck jobs)))
+        (is (zero? (:total jobs)))
+        (is (empty? prefetched-jobs)))
+
+      ; Publishing jobs
+      (dotimes [n num-jobs]
+        (schedule-job db-conn :test-foo :begin {:id (inc n)} (java.util.Date.)))
+
+      ; Publishing one stuck job
+      (let [scheduled-id (schedule-job db-conn :test-foo :begin {:id 1} (java.util.Date. 0))]
+        (queries/insert-job<! db-conn scheduled-id 0 "test-foo" "begin" (pr-str {:id 1}) 1 (java.util.Date. 0)))
+
+      ; Status after publishing
+      (let [{{:keys [scheduled-jobs jobs]} :db-queue
+             :keys [consumers]
+             :as status}
+            (status wrk)]
+        (is (= 1 (count consumers)))
+        (is (<= 50 (:overdue scheduled-jobs) 101))
+        (is (<= 50 (:total scheduled-jobs) 101))
+        (is (<= 0 (:stuck jobs) 1))
+        (is (<= 0 (:total jobs) 50)))
+
+      (is (deref success? 15000 false) "Failed to process jobs in time. Test results below depend on this.")
+
+      ; Extra sleep time to let stuck job processing finish
+      (Thread/sleep 1000)
+
+      ; Status after finished
+      (let [{{:keys [scheduled-jobs jobs]} :db-queue
+             :keys [consumers recent-jobs recent-jobs-stats]
+             :as status}
+            (status wrk)]
+        (is (= 1 (count consumers)))
+        (is (zero? (:overdue scheduled-jobs)))
+        (is (zero? (:total scheduled-jobs)))
+        (is (zero? (:stuck jobs)))
+        (is (zero? (:total jobs)))
+        (is (= 50 (count recent-jobs)))
+        (is (= 50 (get-in recent-jobs-stats [:job-types :test-foo])))
+        (is (= 101 (:jobs-executed (first consumers))))))))
 

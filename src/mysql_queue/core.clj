@@ -1,7 +1,7 @@
 (ns mysql-queue.core
   "A MySQL-backed durable queue implementation with scheduled jobs support."
   (:require [mysql-queue.queries :as queries]
-            [mysql-queue.utils :refer [while-let fn-options with-error-handler profile-block meter ns->ms]]
+            [mysql-queue.utils :refer [while-let fn-options with-error-handler profile-block meter ns->ms numeric-stats]]
             [clojure.string :as string]
             [clojure.set :as clj-set]
             [clojure.edn :as edn]
@@ -21,7 +21,7 @@
   (stop [worker timeout-secs]))
 
 (defrecord Worker
-  [db-conn input-chan status sieve status-threads consumer-threads scheduler-thread recovery-thread options]
+  [db-conn fn-bindings input-chan status sieve status-threads consumer-threads scheduler-thread recovery-thread options]
   Stoppable
   (stop [this timeout-secs]
     (when (:running @status)
@@ -58,7 +58,8 @@
      (clojure.core/name name)
      (clojure.core/name status)
      (pr-str parameters)
-     attempt])
+     attempt
+     (Date.)])
   Persistent
   (persist [this conn]
     (if id
@@ -161,7 +162,7 @@
         (cleanup job db-conn)
         (try
           (log-fn :info job "Executing job " job)
-          (let [[status params] (-> (meter m :job-fn (job-fn status parameters))
+          (let [[status params] (-> (meter m :user (job-fn status parameters))
                                     job-result-or-nil (or [:done nil]))]
             (-> job (beget status params) (persist db-conn)))
           (catch Exception e
@@ -183,11 +184,16 @@
       (log-fn :info job "Executing job " job)
       (-> job beget (persist db-conn)))))
 
+(defn- bound-job-names
+  "Takes a map of job bindings and returns a sequence of names as strings."
+  [fn-bindings]
+  (map name (keys fn-bindings)))
+
 (defn- get-scheduled-jobs
   "Searches for ready scheduled jobs and attempts to insert root jobs for each of those.
    Returns the number of jobs added, or false if channel was closed."
   [db-conn n fn-bindings sieve]
-  (->> (queries/select-n-ready-scheduled-jobs db-conn (map name (keys fn-bindings)) sieve n)
+  (->> (queries/select-n-ready-scheduled-jobs db-conn (bound-job-names fn-bindings) sieve n)
        (map #(scheduled-job % fn-bindings))))
 
 (defn- get-stuck-jobs
@@ -197,7 +203,7 @@
   [db-conn n fn-bindings threshold sieve]
   (->> (queries/select-n-stuck-jobs db-conn
                                     (map name ultimate-job-states)
-                                    (map name (keys fn-bindings))
+                                    (bound-job-names fn-bindings)
                                     sieve
                                     threshold
                                     n)
@@ -246,15 +252,16 @@
       (try
         (log-fn :debug job "Consumer received job " job)
         (loop [current-job job
+               last-job job
                metrics {}]
           (if current-job
             (do
               (>! status-chan {:id id :state :running-job :job current-job})
               (let [[next-job dmetrics] (<! (thread (execute current-job db-conn log-fn err-fn)))]
-                (recur next-job (merge-with + metrics dmetrics))))
+                (recur next-job current-job (merge-with + metrics dmetrics))))
             (do
-              (>! status-chan {:id id :state :finished-job :job current-job :metrics metrics})
-              (log-fn :info current-job "Completed job " job " in " (ns->ms (:full metrics)) "ms")
+              (>! status-chan {:id id :state :finished-job :job last-job :metrics metrics})
+              (log-fn :info last-job "Completed job " last-job " in " (ns->ms (:full metrics)) "ms")
               nil)))
         (catch Exception e
           (>! status-chan {:id id :state :error :job job})
@@ -350,10 +357,11 @@
         (close! ch)))
     (go-loop [occupations {}]
       (if-let [v (<! ch)]
-        (let [[v ch] (alts! (map #(vector %1 v) out-chs))]
+        (let [[ret ch] (alts! (map #(vector %1 v) out-chs))]
           (when-let [occupation (occupations ch)]
             (swap! sieve disj occupation))
-          (recur (assoc occupations ch v)))
+          (when ret
+            (recur (assoc occupations ch v))))
         (doseq [out-ch out-chs]
           (close! out-ch))))
     [in-ch out-chs sieve]))
@@ -403,6 +411,37 @@
       (persist db-conn)
       :id))
 
+(defn status
+  "Returns a map describing the current status of the worker."
+  [{:keys [db-conn fn-bindings]
+    {recovery-threshold :recovery-threshold-mins} :options
+    :as worker}]
+  (let [serialize-job (fn [job]
+                        (and job
+                             (select-keys job [:id :name :status :metrics :processed-at])))
+        sieve @(:sieve worker)
+        {:keys [consumers] :as raw-status} @(:status worker)
+        recent-jobs (mapcat :recent-jobs (:consumers raw-status))
+        scheduled-status (queries/select-scheduled-jobs-status db-conn (bound-job-names fn-bindings))
+        in-progress-status (queries/select-jobs-status
+                             db-conn
+                             (bound-job-names fn-bindings)
+                             ultimate-job-states
+                             recovery-threshold)
+        consumers (map #(-> %
+                            (dissoc :recent-jobs)
+                            (update :last-job serialize-job))
+                       consumers)]
+    (-> raw-status
+        (assoc :db-queue {:scheduled-jobs scheduled-status :jobs in-progress-status})
+        (assoc :prefetched-jobs (map serialize-job sieve))
+        (assoc :recent-jobs-stats
+               {:job-types (frequencies (map :name recent-jobs))
+                :performance {:user (numeric-stats (keep #(get-in % [:metrics :user]) recent-jobs))
+                              :full (numeric-stats (keep #(get-in % [:metrics :full]) recent-jobs))}})
+        (assoc :recent-jobs (map serialize-job recent-jobs))
+        (assoc :consumers consumers))))
+
 (defn worker
   "Creates a new worker. Takes a database connection db-conn,
    a map of fn-bindings binding job names to job functions, and a number
@@ -412,6 +451,8 @@
      when the publisher will block. Default 10.
    * prefetch - the number of jobs a publisher fetches from the database at once.
      Default 10.
+   * num-stats-jobs - the number of jobs to keep in memory for statistical purpose.
+     Per consumer thread. Default 50.
    * num-consumer-threads - the number of concurrent threads that run jobs at the
      same time.
    * min-scheduler-sleep-interval - the minimum time in seconds the scheduler will sleep
@@ -505,6 +546,7 @@
                                           log-fn)]
     (log-fn :info nil "Starting a new worker...")
     (->Worker db-conn
+              fn-bindings
               in-ch
               status
               sieve

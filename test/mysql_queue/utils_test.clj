@@ -27,3 +27,11 @@
     (is (<= 50000000 (:subop m) 60000000))
     (is (<= 100000000 (:full m)))))
 
+(deftest numeric-stats-test
+  (let [stats (numeric-stats (shuffle (range 1 101)))]
+    (is (= 1 (:min stats)))
+    (is (= 100 (:max stats)))
+    (is (= 50 (:median stats)))
+    (is (= 50.5 (:mean stats)))
+    (is (= 90 (:90p stats)))))
+
