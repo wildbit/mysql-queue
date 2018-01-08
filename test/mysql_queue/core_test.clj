@@ -239,7 +239,7 @@
         exception (promise)
         check-ins (check-in-atom expected-set success?)
         jobs {:test-foo (fn [status {id :id :as args}]
-                          (Thread/sleep 20)
+                          (Thread/sleep 50)
                           (swap! check-ins conj id)
                           [:done args])}]
     (with-worker [wrk (worker db-conn
