@@ -239,7 +239,7 @@
         exception (promise)
         check-ins (check-in-atom expected-set success?)
         jobs {:test-foo (fn [status {id :id :as args}]
-                          (Thread/sleep 50)
+                          (Thread/sleep 20)
                           (swap! check-ins conj id)
                           [:done args])}]
     (with-worker [wrk (worker db-conn
@@ -273,8 +273,8 @@
              :as status}
             (status wrk)]
         (is (= 1 (count consumers)))
-        (is (<= 50 (:overdue scheduled-jobs) 101))
-        (is (<= 50 (:total scheduled-jobs) 101))
+        (is (<= 1 (:overdue scheduled-jobs) 101))
+        (is (<= 1 (:total scheduled-jobs) 101))
         (is (<= 0 (:stuck jobs) 1))
         (is (<= 0 (:total jobs) 50)))
 
