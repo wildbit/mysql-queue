@@ -103,7 +103,9 @@
     (job-summary-string this))
   Fertile
   (beget [this]
-    (->Job user-fn nil scheduled-job-id id name status parameters (inc attempt)))
+    (if (< attempt max-retries)
+      (->Job user-fn nil scheduled-job-id id name status parameters (inc attempt))
+      (->Job user-fn nil scheduled-job-id id name :failed parameters attempt)))
   (beget [this _] (beget this))
   (beget [this _ _] (beget this)))
 
