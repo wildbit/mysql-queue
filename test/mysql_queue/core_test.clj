@@ -233,9 +233,9 @@
                               :num-consumer-threads 1
                               :max-scheduler-sleep-interval 0.01
                               :max-recovery-sleep-interval 0.01
-                              :recovery-threshold-mins 0.02
-                              :job-timeout-mins 0.01)]
-      (Thread/sleep 6000)
+                              :recovery-threshold-mins (/ 1 60)
+                              :job-timeout-mins (/ 1 60))]
+      (Thread/sleep 10000)
       (is (zero? (count-jobs db-conn)))
       (is (zero? (queue-size db-conn))))))
 
