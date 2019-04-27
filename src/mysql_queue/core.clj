@@ -8,7 +8,19 @@
             [clojure.core.async :as async :refer [chan >!! >! <! <!! go go-loop thread thread-call close! timeout alts! alts!!]]
             [clojure.core.async.impl.protocols :as async-proto :refer [closed?]])
   (:import (com.mysql.jdbc.exceptions.jdbc4 MySQLIntegrityConstraintViolationException)
-           (java.util Date)))
+           (java.util Date)
+           (java.util.concurrent TimeoutException)))
+
+(defmacro with-timeout
+  "A macro that executes the body in a future with a specified
+   timeout. Returns nil if times out. Throws an exception if
+   body returns nil."
+  [timeout & body]
+  `(let [f# (future ~@body)
+         ret# (deref f# ~timeout ~::timed-out)]
+     (when (nil? ret#) (throw (Exception. "with-timeout body returned nil")))
+     (when (= ret# ~::timed-out) (future-cancel f#))
+     ret#))
 
 (def ultimate-job-states #{:canceled :failed :done})
 (def max-retries 5)
@@ -248,7 +260,7 @@
 
 (defn- consumer-thread
   "Consumer loop. Automatically quits if the listen-chan is closed. Runs in a go-thread."
-  [id listen-chan status-chan db-conn log-fn err-fn]
+  [id listen-chan status-chan db-conn log-fn err-fn job-timeout]
   (go
     (while-let [job (<! listen-chan)]
       (try
@@ -259,8 +271,9 @@
           (if current-job
             (do
               (>! status-chan {:id id :state :running-job :job current-job})
-              (let [[next-job dmetrics] (<! (thread (execute current-job db-conn log-fn err-fn)))]
-                (recur next-job current-job (merge-with + metrics dmetrics))))
+              (if-let [[next-job dmetrics] (<! (thread (with-timeout job-timeout (execute current-job db-conn log-fn err-fn))))]
+                (recur next-job current-job (merge-with + metrics dmetrics))
+                (throw (TimeoutException. "Job timed out"))))
             (do
               (>! status-chan {:id id :state :finished-job :job last-job :metrics metrics})
               (log-fn :info last-job "Completed job " last-job " in " (ns->ms (:full metrics)) "ms")
@@ -451,6 +464,7 @@
    
    * buffer-size - maximum number of jobs allowed into internal queue. Determines
      when the publisher will block. Default 10.
+   * job-timeout-mins - the number of minutes after which the job times out. Default 20.
    * prefetch - the number of jobs a publisher fetches from the database at once.
      Default 10.
    * num-stats-jobs - the number of jobs to keep in memory for statistical purpose.
@@ -465,14 +479,15 @@
      sleep before querying the database for stuck jobs. Default 0 seconds.
    * max-recovery-sleep-interval - the maximum time in seconds the recovery thread will
      sleep before qerying the database for stuck jobs. Default 10 seconds.
-   * recovery-threshold-mins - the number of seconds after which a job is considered
-     stuck and will be picked up by the recovery thread.
+   * recovery-threshold-mins - the number of minutes after which a job is considered
+     stuck and will be picked up by the recovery thread. Default 20.
    * log-fn - user-provided logging function of 3 arguments: level (keyword), job (record), message (msg).
    * err-fn - user-provided error function of one argument: error (Exception)."
   [db-conn
    fn-bindings
    &{:keys [buffer-size
             prefetch
+            job-timeout-mins
             num-stats-jobs
             num-consumer-threads
             min-scheduler-sleep-interval
@@ -483,6 +498,7 @@
             log-fn
             err-fn]
      :or {buffer-size 10
+          job-timeout-mins 20
           prefetch 10
           num-stats-jobs 50
           num-consumer-threads 2
@@ -521,7 +537,7 @@
         [in-ch out-chs sieve] (deduplicate queue-chan num-consumer-threads)
         consumer-threads (->> out-chs
                               (map-indexed
-                                #(consumer-thread %1 %2 consumer-status-channel db-conn log-fn err-fn))
+                                #(consumer-thread %1 %2 consumer-status-channel db-conn log-fn err-fn (* 60 1000 job-timeout-mins)))
                               (into [])
                               doall)
         handler (partial publisher-error-handler log-fn err-fn)

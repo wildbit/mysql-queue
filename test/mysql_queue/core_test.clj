@@ -25,6 +25,10 @@
   [db-conn]
   (sql/query db-conn ["SELECT COUNT(*) AS c FROM jobs"] {:result-set-fn (comp :c first)}))
 
+(defn queue-size
+  [db-conn]
+  (sql/query db-conn ["SELECT COUNT(*) AS c FROM scheduled_jobs"] {:result-set-fn (comp :c first)}))
+
 (defn setup-db
   [f]
   (initialize! db-conn)
@@ -206,7 +210,7 @@
       (is (= num-jobs (count @check-ins))
           "The number of executed jobs doesn't match the number of jobs queued."))))
 
-(deftest stuck-job-max-attempts
+(deftest stuck-job-max-attempts-test
   (let [jobs {:test-foo #(throw (Exception. "This job should not have been executed, because it reached max attempts."))}
         scheduled-id (schedule-job db-conn :test-foo :begin {} (java.util.Date. 0))]
     (queries/insert-job<! db-conn scheduled-id 0 "test-foo" "begin" (pr-str {}) 5 (java.util.Date. 0))
@@ -220,6 +224,20 @@
       (Thread/sleep 1000)
       (is (zero? (count (queries/select-n-stuck-jobs db-conn ultimate-job-states ["test-foo"] [0] 5 5))))
       (is (zero? (count-jobs db-conn))))))
+
+(deftest job-timeout-test
+  (let [jobs {:test-foo (fn [_ _] (Thread/sleep 10000) [:done {}])}]
+    (schedule-job db-conn :test-foo :begin {} (java.util.Date.))
+    (with-worker [wrk (worker db-conn
+                              jobs
+                              :num-consumer-threads 1
+                              :max-scheduler-sleep-interval 0.01
+                              :max-recovery-sleep-interval 0.01
+                              :recovery-threshold-mins 0.02
+                              :job-timeout-mins 0.01)]
+      (Thread/sleep 6000)
+      (is (zero? (count-jobs db-conn)))
+      (is (zero? (queue-size db-conn))))))
 
 (deftest graceful-shutdown-test
   (let [num-jobs 2
