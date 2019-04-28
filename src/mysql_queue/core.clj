@@ -18,9 +18,11 @@
   [timeout & body]
   `(let [f# (future ~@body)
          ret# (deref f# ~timeout ~::timed-out)]
-     (when (nil? ret#) (throw (Exception. "with-timeout body returned nil")))
-     (when (= ret# ~::timed-out) (future-cancel f#))
-     ret#))
+     (if (= ret# ~::timed-out)
+       (do
+         (future-cancel f#)
+         (throw (TimeoutException. (str "Execution took more than " ~timeout "ms. Terminating."))))
+       ret#)))
 
 (def ultimate-job-states #{:canceled :failed :done})
 (def max-retries 5)
@@ -54,7 +56,7 @@
 
 (defprotocol Executable
   (finished? [job])
-  (execute [job db-conn log-fn err-fn]))
+  (execute [job db-conn log-fn err-fn timeout]))
 
 (defprotocol Fertile
   (beget [parent] [parent status] [parent status parameters]))
@@ -170,13 +172,13 @@
   Job
   (finished? [job]
     (ultimate-job-states (:status job)))
-  (execute [{:as job job-fn :user-fn :keys [status parameters attempt]} db-conn log-fn err-fn]
+  (execute [{:as job job-fn :user-fn :keys [status parameters attempt]} db-conn log-fn err-fn timeout]
     (profile-block [m]
       (if (finished? job)
         (cleanup job db-conn)
         (try
           (log-fn :info job "Executing job " job)
-          (let [[status params] (-> (meter m :user (job-fn status parameters))
+          (let [[status params] (-> (meter m :user (with-timeout timeout (job-fn status parameters)))
                                     job-result-or-nil (or [:done nil]))]
             (-> job (beget status params) (persist db-conn)))
           (catch Exception e
@@ -186,14 +188,14 @@
               (-> job (beget :failed) (persist db-conn))))))))
   StuckJob
   (finished? [job] false)
-  (execute [job db-conn log-fn err-fn]
+  (execute [job db-conn log-fn err-fn timeout]
     (profile-block [_]
       (log-fn :info job "Recovering job " job)
       (-> job beget (persist db-conn))))
   ScheduledJob
   (finished? [job]
     (throw (UnsupportedOperationException. "finished? is not implemented for ScheduledJob.")))
-  (execute [job db-conn log-fn _err-fn]
+  (execute [job db-conn log-fn err-fn timeout]
     (profile-block [_]
       (log-fn :info job "Executing job " job)
       (-> job beget (persist db-conn)))))
@@ -271,9 +273,8 @@
           (if current-job
             (do
               (>! status-chan {:id id :state :running-job :job current-job})
-              (if-let [[next-job dmetrics] (<! (thread (with-timeout job-timeout (execute current-job db-conn log-fn err-fn))))]
-                (recur next-job current-job (merge-with + metrics dmetrics))
-                (throw (TimeoutException. "Job timed out"))))
+              (let [[next-job dmetrics] (<! (thread (execute current-job db-conn log-fn err-fn job-timeout)))]
+                (recur next-job current-job (merge-with + metrics dmetrics))))
             (do
               (>! status-chan {:id id :state :finished-job :job last-job :metrics metrics})
               (log-fn :info last-job "Completed job " last-job " in " (ns->ms (:full metrics)) "ms")

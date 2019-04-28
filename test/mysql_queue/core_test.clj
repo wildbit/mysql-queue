@@ -226,18 +226,22 @@
       (is (zero? (count-jobs db-conn))))))
 
 (deftest job-timeout-test
-  (let [jobs {:test-foo (fn [_ _] (Thread/sleep 10000) [:done {}])}]
+  (let [attempt (atom 0)
+        jobs {:test-foo (fn [_ _]
+                          (swap! attempt inc)
+                          (when (= 1 @attempt)
+                            (Thread/sleep 10000))
+                          [:done {}])}]
     (schedule-job db-conn :test-foo :begin {} (java.util.Date.))
     (with-worker [wrk (worker db-conn
                               jobs
                               :num-consumer-threads 1
-                              :max-scheduler-sleep-interval 0.01
-                              :max-recovery-sleep-interval 0.01
-                              :recovery-threshold-mins (/ 1 60)
+                              ; run scheduler every 0.5s
+                              :max-scheduler-sleep-interval 0.5
+                              ; terminate jobs that take over 1 second
                               :job-timeout-mins (/ 1 60))]
-      (Thread/sleep 10000)
-      (is (zero? (count-jobs db-conn)))
-      (is (zero? (queue-size db-conn))))))
+      (Thread/sleep 3000)
+      (is (= 2 @attempt)))))
 
 (deftest graceful-shutdown-test
   (let [num-jobs 2
