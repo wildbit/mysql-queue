@@ -1,11 +1,12 @@
+dist: trusty
 language: clojure
 services:
   - mysql
 jdk:
   - openjdk7
-  - oraclejdk7
   - oraclejdk8
   - oraclejdk9
+  - oraclejdk11
 script: "lein test-all"
 before_script: "echo 'CREATE DATABASE IF NOT EXISTS clj_mysql_queue;' | mysql -uroot"
 
