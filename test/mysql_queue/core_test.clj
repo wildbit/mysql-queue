@@ -21,6 +21,14 @@
   [db-conn job-name]
   (sql/delete! db-conn :scheduled_jobs ["name = ?" job-name]))
 
+(defn count-jobs
+  [db-conn]
+  (sql/query db-conn ["SELECT COUNT(*) AS c FROM jobs"] {:result-set-fn (comp :c first)}))
+
+(defn queue-size
+  [db-conn]
+  (sql/query db-conn ["SELECT COUNT(*) AS c FROM scheduled_jobs"] {:result-set-fn (comp :c first)}))
+
 (defn setup-db
   [f]
   (initialize! db-conn)
@@ -201,6 +209,39 @@
                "Exception?: " (deref exception 0 "nope")))
       (is (= num-jobs (count @check-ins))
           "The number of executed jobs doesn't match the number of jobs queued."))))
+
+(deftest stuck-job-max-attempts-test
+  (let [jobs {:test-foo #(throw (Exception. "This job should not have been executed, because it reached max attempts."))}
+        scheduled-id (schedule-job db-conn :test-foo :begin {} (java.util.Date. 0))]
+    (queries/insert-job<! db-conn scheduled-id 0 "test-foo" "begin" (pr-str {}) 5 (java.util.Date. 0))
+    (is (= 1 (count (queries/select-n-stuck-jobs db-conn ultimate-job-states ["test-foo"] [0] 5 5))))
+    (is (= 1 (count-jobs db-conn)))
+    (with-worker [wrk (worker db-conn
+                              jobs
+                              :num-consumer-threads 1
+                              :max-scheduler-sleep-interval 0.5
+                              :max-recovery-sleep-interval 0.5)]
+      (Thread/sleep 1000)
+      (is (zero? (count (queries/select-n-stuck-jobs db-conn ultimate-job-states ["test-foo"] [0] 5 5))))
+      (is (zero? (count-jobs db-conn))))))
+
+(deftest job-timeout-test
+  (let [attempt (atom 0)
+        jobs {:test-foo (fn [_ _]
+                          (swap! attempt inc)
+                          (when (= 1 @attempt)
+                            (Thread/sleep 10000))
+                          [:done {}])}]
+    (schedule-job db-conn :test-foo :begin {} (java.util.Date.))
+    (with-worker [wrk (worker db-conn
+                              jobs
+                              :num-consumer-threads 1
+                              ; run scheduler every 0.5s
+                              :max-scheduler-sleep-interval 0.5
+                              ; terminate jobs that take over 1 second
+                              :job-timeout-mins (/ 1 60))]
+      (Thread/sleep 3000)
+      (is (= 2 @attempt)))))
 
 (deftest graceful-shutdown-test
   (let [num-jobs 2
